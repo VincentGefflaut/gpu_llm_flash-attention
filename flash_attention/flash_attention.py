@@ -100,9 +100,36 @@ class FlashAttentionPytorch(torch.autograd.Function):
             None: No gradient for is_causal
         """
         Q, K, V, L, O = ctx.saved_tensors
-        dQ, dK, dV, _ = attention_backward_impl(
-            Q, K, V, L, O, dO, ctx.sqrt_d, ctx.is_causal
+        device = Q.device
+        dtype = Q.dtype
+        batch_size, seq_q, d = Q.shape
+        seq_k = K.shape[1]
+
+        # Allocate outputs
+        dQ = torch.zeros_like(Q)
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
+
+        # Launch Triton backward kernel
+        BLOCK_Q = 64
+        BLOCK_K = 32
+        grid = (triton.cdiv(seq_q, BLOCK_Q), batch_size)
+
+        flash_bwd_kernel[grid](
+            Q, K, V, O, L, dO, dQ, dK, dV,
+            Q.stride(0), Q.stride(1), Q.stride(2),
+            K.stride(0), K.stride(1), K.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            O.stride(0), O.stride(1), O.stride(2),
+            L.stride(0), L.stride(1),
+            dO.stride(0), dO.stride(1), dO.stride(2),
+            dQ.stride(0), dQ.stride(1), dQ.stride(2),
+            dK.stride(0), dK.stride(1), dK.stride(2),
+            dV.stride(0), dV.stride(1), dV.stride(2),
+            seq_q, seq_k, ctx.sqrt_d,
+            D=d, BLOCK_Q=BLOCK_Q, BLOCK_K=BLOCK_K, is_causal=ctx.is_causal,
         )
+
         return dQ, dK, dV, None
 
 def attention_backward_impl(Q, K, V, L, O, dO, sqrt_d, is_causal):
@@ -156,6 +183,144 @@ def attention_backward_impl(Q, K, V, L, O, dO, sqrt_d, is_causal):
     dQ = dS @ K / sqrt_d
     dK = dS.transpose(-2, -1) @ Q / sqrt_d
     return dQ, dK, dV, None
+
+
+@triton.jit
+def flash_bwd_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr, L_ptr, dO_ptr, dQ_ptr, dK_ptr, dV_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    stride_dqb, stride_dqq, stride_dqd,
+    stride_dkb, stride_dkk, stride_dkd,
+    stride_dvb, stride_dvk, stride_dvd,
+    N_QUERIES, N_KEYS, scale,
+    D: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    is_causal: tl.constexpr,
+):
+    pid_q = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    # Batch base pointers
+    Q_ptr = Q_ptr + pid_b * stride_qb
+    K_ptr = K_ptr + pid_b * stride_kb
+    V_ptr = V_ptr + pid_b * stride_vb
+    O_ptr = O_ptr + pid_b * stride_ob
+    dO_ptr = dO_ptr + pid_b * stride_dqb
+    dQ_ptr = dQ_ptr + pid_b * stride_dqb
+    dK_ptr = dK_ptr + pid_b * stride_dkb
+    dV_ptr = dV_ptr + pid_b * stride_dvb
+    L_ptr = L_ptr + pid_b * stride_lb
+
+    Q_block = tl.make_block_ptr(
+        Q_ptr,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(pid_q * BLOCK_Q, 0),
+        block_shape=(BLOCK_Q, D),
+        order=(1, 0),
+    )
+    O_block = tl.make_block_ptr(
+        O_ptr,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(pid_q * BLOCK_Q, 0),
+        block_shape=(BLOCK_Q, D),
+        order=(1, 0),
+    )
+    dO_block = tl.make_block_ptr(
+        dO_ptr,
+        shape=(N_QUERIES, D),
+        strides=(stride_dqq, stride_dqd),
+        offsets=(pid_q * BLOCK_Q, 0),
+        block_shape=(BLOCK_Q, D),
+        order=(1, 0),
+    )
+    dQ_block = tl.make_block_ptr(
+        dQ_ptr,
+        shape=(N_QUERIES, D),
+        strides=(stride_dqq, stride_dqd),
+        offsets=(pid_q * BLOCK_Q, 0),
+        block_shape=(BLOCK_Q, D),
+        order=(1, 0),
+    )
+    L_block = tl.make_block_ptr(
+        L_ptr,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(pid_q * BLOCK_Q,),
+        block_shape=(BLOCK_Q,),
+        order=(0,),
+    )
+
+    Q = tl.load(Q_block)
+    O = tl.load(O_block)
+    dO = tl.load(dO_block)
+    L = tl.load(L_block)
+
+    # local accumulator for dQ
+    dQ_local = tl.zeros((BLOCK_Q, D), dtype=tl.float32)
+
+    num_key_blocks = tl.cdiv(N_KEYS, BLOCK_K)
+    K_block = tl.make_block_ptr(
+        K_ptr,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(BLOCK_K, D),
+        order=(1, 0),
+    )
+    V_block = tl.make_block_ptr(
+        V_ptr,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(BLOCK_K, D),
+        order=(1, 0),
+    )
+
+    for block_idx in range(num_key_blocks):
+        K = tl.load(K_block, boundary_check=(0,1), padding_option="zero")
+        V = tl.load(V_block, boundary_check=(0,1), padding_option="zero")
+        # Recompute scores
+        S = tl.dot(Q, tl.trans(K)) / scale
+        if is_causal:
+            q_idx = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
+            k_idx = block_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+            mask = k_idx[None, :] > q_idx[:, None]
+            S = tl.where(mask, float('-inf'), S)
+        P = tl.exp(S - L[:, None])
+        # dV contribution: (BLOCK_K, D) = P^T @ dO
+        dV_block_local = tl.dot(tl.trans(P), dO)
+        # dP = dO @ V^T (BLOCK_Q, BLOCK_K)
+        dP = tl.dot(dO, tl.trans(V))
+        # D = rowsum(O * dO)
+        D_local = tl.sum(O * dO, axis=1)
+        # dS = P * (dP - D)
+        dS = P * (dP - D_local[:, None])
+        # dQ_local += dS @ K / sqrt_d
+        dQ_local = dQ_local + tl.dot(dS, K) / scale
+        # dK contribution: (BLOCK_K, D) = dS^T @ Q / sqrt_d
+        dK_block_local = tl.dot(tl.trans(dS), Q) / scale
+
+        # Atomically add dK_block_local and dV_block_local into global dK/dV
+        for kk in range(BLOCK_K):
+            key_pos = block_idx * BLOCK_K + kk
+            for dd in range(D):
+                if key_pos < N_KEYS:
+                    tl.atomic_add(dK_ptr + key_pos * stride_dkk + dd * stride_dkd, dK_block_local[kk, dd])
+                    tl.atomic_add(dV_ptr + key_pos * stride_dvk + dd * stride_dvd, dV_block_local[kk, dd])
+
+        K_block = K_block.advance((BLOCK_K, 0))
+        V_block = V_block.advance((BLOCK_K, 0))
+
+    # store dQ_local to dQ_block
+    tl.store(dQ_block, dQ_local)
+
 
 class FlashAttentionTriton(torch.autograd.Function):
     """Flash Attention using Triton kernel for forward pass."""
