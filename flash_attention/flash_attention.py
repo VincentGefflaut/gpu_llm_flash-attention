@@ -1,5 +1,7 @@
 import torch
 import math
+import triton
+import triton.language as tl
 
 class FlashAttentionPytorch(torch.autograd.Function):
     @staticmethod
@@ -154,3 +156,182 @@ def attention_backward_impl(Q, K, V, L, O, dO, sqrt_d, is_causal):
     dQ = dS @ K / sqrt_d
     dK = dS.transpose(-2, -1) @ Q / sqrt_d
     return dQ, dK, dV, None
+
+class FlashAttentionTriton(torch.autograd.Function):
+    """Flash Attention using Triton kernel for forward pass."""
+
+    @staticmethod
+    def forward(ctx, Q, K, V, is_causal=False):
+        """
+        Forward pass using Triton kernel.
+
+        Args:
+            Q: Query tensor of shape (batch, seq_q, d)
+            K: Key tensor of shape (batch, seq_k, d)
+            V: Value tensor of shape (batch, seq_k, d)
+            is_causal: Whether to apply causal masking
+
+        Returns:
+            Output tensor of shape (batch, seq_q, d)
+        """
+        # Allocate output tensors O and L
+        # Choose block sizes (e.g., BLOCK_Q = BLOCK_K = 64)
+        # Configure grid: (num_query_blocks, batch_size)
+        # Launch flash_fwd_kernel
+        # Save tensors for backward
+        # Return O
+        device = Q.device
+        dtype = Q.dtype
+        batch_size, seq_q, d = Q.shape
+        seq_k = K.shape[1]
+        
+        O = torch.empty((batch_size, seq_q, d), device=device, dtype=dtype)
+        L = torch.empty((batch_size, seq_q), device=device, dtype=dtype)
+        
+        # Calculate grid dimensions
+        BLOCK_Q = 64
+        BLOCK_K = 32
+        grid = (triton.cdiv(seq_q, BLOCK_Q), batch_size)
+
+        # Launch Triton kernel for both causal and non-causal cases. Masking is
+        # handled inside the kernel via the `is_causal` constexpr parameter.
+        flash_fwd_kernel[grid](
+            Q, K, V, O, L,
+            Q.stride(0), Q.stride(1), Q.stride(2),
+            K.stride(0), K.stride(1), K.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            O.stride(0), O.stride(1), O.stride(2),
+            L.stride(0), L.stride(1),
+            seq_q, seq_k, math.sqrt(d),
+            D=d, BLOCK_Q=64, BLOCK_K=32, is_causal=is_causal
+        )
+
+        # Save for backward
+        ctx.save_for_backward(Q, K, V, L, O)
+        ctx.is_causal = is_causal
+        ctx.sqrt_d = math.sqrt(d)
+        return O
+
+    @staticmethod
+    def backward(ctx, dO):
+        """
+        Backward pass for FlashAttentionTriton.
+
+        Args:
+            ctx: Context object with saved tensors
+            dO: Gradient of loss w.r.t. output
+
+        Returns:
+            dQ: Gradient w.r.t. Q
+            dK: Gradient w.r.t. K
+            dV: Gradient w.r.t. V
+            None: No gradient for is_causal
+        """
+        Q, K, V, L, O = ctx.saved_tensors
+        dQ, dK, dV, _ = attention_backward_impl(
+            Q, K, V, L, O, dO, ctx.sqrt_d, ctx.is_causal
+        )
+        return dQ, dK, dV, None
+
+
+@triton.jit
+def flash_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr, L_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    N_QUERIES, N_KEYS, scale,
+    D: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    is_causal: tl.constexpr,
+):
+    """
+    Flash Attention forward kernel using online softmax algorithm.
+
+    Each program instance processes one query block for one batch element.
+    """
+    pid_q = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    Q_ptr = Q_ptr + pid_b * stride_qb
+    Q_block = tl.make_block_ptr(
+        Q_ptr,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(pid_q * BLOCK_Q, 0),
+        block_shape=(BLOCK_Q, D),
+        order=(1, 0),
+    )
+    K_ptr = K_ptr + pid_b * stride_kb
+    K_block = tl.make_block_ptr(
+        K_ptr,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(BLOCK_K, D),
+        order=(1, 0),
+    )
+    V_ptr = V_ptr + pid_b * stride_vb
+    V_block = tl.make_block_ptr(
+        V_ptr,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(BLOCK_K, D),
+        order=(1, 0),
+    )
+    O_ptr = O_ptr + pid_b * stride_ob
+    O_block = tl.make_block_ptr(
+        O_ptr,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(pid_q * BLOCK_Q, 0),
+        block_shape=(BLOCK_Q, D),
+        order=(1, 0),
+    )
+    L_ptr = L_ptr + pid_b * stride_lb
+    L_block = tl.make_block_ptr(
+        L_ptr,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(pid_q * BLOCK_Q,),
+        block_shape=(BLOCK_Q,),
+        order=(0,),
+    )
+
+    Q = tl.load(Q_block)
+    num_key_blocks = tl.cdiv(N_KEYS, BLOCK_K)
+    m_prev = tl.full((BLOCK_Q,), float("-inf"), dtype=tl.float32)
+    l_prev = tl.zeros((BLOCK_Q,), dtype=tl.float32)
+    o_prev = tl.zeros((BLOCK_Q, D), dtype=tl.float32)
+
+
+    for block_idx in range(num_key_blocks):
+        K = tl.load(K_block, boundary_check=(0,1), padding_option="zero")
+        V = tl.load(V_block, boundary_check=(0,1), padding_option="zero")
+        # Compute attention scores
+        X = tl.dot(Q, tl.trans(K)) / scale
+        if is_causal:
+            q_idx = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
+            k_idx = block_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+            mask = k_idx[None, :] > q_idx[:, None]
+            X = tl.where(mask, float('-inf'), X)
+        m_i = tl.max(X, axis=-1)
+        m = tl.maximum(m_prev, m_i)
+        exp_m_prev = tl.exp(m_prev - m)
+        exp_x_m = tl.exp(X - m[:,None])
+        l = l_prev * exp_m_prev + tl.sum(exp_x_m, axis=-1)
+        o = o_prev * exp_m_prev[:,None]
+        o = o + tl.dot(exp_x_m, V)
+        m_prev = m
+        l_prev = l
+        o_prev = o
+
+        K_block = K_block.advance((BLOCK_K, 0))
+        V_block = V_block.advance((BLOCK_K, 0))
+
+    o_prev = o_prev / l_prev[:,None]
+    tl.store(O_block, o_prev)
+    tl.store(L_block, m_prev + tl.log(l_prev + 1e-20))
