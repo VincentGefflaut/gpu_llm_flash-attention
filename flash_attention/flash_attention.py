@@ -42,16 +42,20 @@ class FlashAttentionPytorch(torch.autograd.Function):
         *batch_size, seq_len, head_dim = Q.shape
         sqrt_d = math.sqrt(head_dim)
         device = Q.device
-        O = torch.zeros((*batch_size, seq_len, head_dim), device=device)
-        L = torch.zeros((*batch_size, seq_len), device=device)
+        dtype = Q.dtype
+        O = torch.zeros((*batch_size, seq_len, head_dim), device=device, dtype=dtype)
+        L = torch.zeros((*batch_size, seq_len), device=device, dtype=dtype)
         for j in range(0, seq_len, block_size):
             block_end = min(j + block_size, seq_len)
             Q_block = Q[:, j:block_end, :]  # (batch, block_q, head_dim)
             block_q = block_end - j
-            m_prev = torch.full((*batch_size, block_q), float("-inf"), device=device)
-            l_prev = torch.zeros((*batch_size, block_q), device=device)
-            o_prev = torch.zeros((*batch_size, block_q, head_dim), device=device)
+            m_prev = torch.full((*batch_size, block_q), float("-inf"), device=device, dtype=dtype)
+            l_prev = torch.zeros((*batch_size, block_q), device=device, dtype=dtype)
+            o_prev = torch.zeros((*batch_size, block_q, head_dim), device=device, dtype=dtype)
             for i in range(0, seq_len, block_size):
+                # For causal attention, later key blocks are always fully masked.
+                if is_causal and i >= block_end:
+                    break
                 inner_block_end = min(i + block_size, seq_len)
                 K_block = K[:, i:inner_block_end, :]  # (batch, block_k, head_dim)
                 V_block = V[:, i:inner_block_end, :]  # (batch, block_k, head_dim)
@@ -141,14 +145,15 @@ def attention_backward_impl(Q, K, V, L, O, dO, sqrt_d, is_causal):
     # 8. Compute dQ = dS @ K / sqrt(d)
     # 9. Compute dK = dS^T @ Q / sqrt(d)
     device = Q.device
-    seq_len = Q.shape[1]
+    seq_q = Q.shape[1]
+    seq_k = K.shape[1]
     D = (dO * O).sum(dim=-1, keepdim=True)
-    S = torch.matmul(Q, K.transpose(-2, -1)) / sqrt_d # (batch_size, seq_len, seq_len)
+    S = torch.matmul(Q, K.transpose(-2, -1)) / sqrt_d  # (batch_size, seq_q, seq_k)
     if is_causal:
-        q_idx = torch.arange(0, seq_len, device=device).unsqueeze(-1)
-        k_idx = torch.arange(0, seq_len, device=device).unsqueeze(0)
-        mask = (q_idx < k_idx).unsqueeze(0)  # (1, block_q, block_k)
-        S = S.masked_fill(mask, float('-inf'))
+        causal_mask = torch.triu(
+            torch.ones(seq_q, seq_k, device=device, dtype=torch.bool), diagonal=1
+        )
+        S = S.masked_fill(causal_mask.unsqueeze(0), float('-inf'))
     P = torch.exp(S - L.unsqueeze(-1))
     dV = P.transpose(-2, -1) @ dO
     dP = dO @ V.transpose(-2, -1)
@@ -341,7 +346,7 @@ class FlashAttentionTriton(torch.autograd.Function):
             O.stride(0), O.stride(1), O.stride(2),
             L.stride(0), L.stride(1),
             seq_q, seq_k, math.sqrt(d),
-            D=d, BLOCK_Q=64, BLOCK_K=32, is_causal=is_causal
+            D=d, BLOCK_Q=64, BLOCK_K=32, is_causal=is_causal  # type: ignore[arg-type]
         )
 
         # Save for backward
@@ -439,7 +444,9 @@ def flash_fwd_kernel(
         order=(0,),
     )
 
-    Q = tl.load(Q_block)
+    Q = tl.load(Q_block, boundary_check=(0, 1), padding_option="zero")
+    q_idx = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    q_mask = q_idx < N_QUERIES
     num_key_blocks = tl.cdiv(N_KEYS, BLOCK_K)
     m_prev = tl.full((BLOCK_Q,), float("-inf"), dtype=tl.float32)
     l_prev = tl.zeros((BLOCK_Q,), dtype=tl.float32)
@@ -451,18 +458,20 @@ def flash_fwd_kernel(
         V = tl.load(V_block, boundary_check=(0,1), padding_option="zero")
         # Compute attention scores
         X = tl.dot(Q, tl.trans(K)) / scale
+        k_idx = block_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+        k_mask = k_idx < N_KEYS
+        X = tl.where(k_mask[None, :], X, float("-inf"))
+        X = tl.where(q_mask[:, None], X, float("-inf"))
         if is_causal:
-            q_idx = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
-            k_idx = block_idx * BLOCK_K + tl.arange(0, BLOCK_K)
-            mask = k_idx[None, :] > q_idx[:, None]
-            X = tl.where(mask, float('-inf'), X)
+            mask = q_idx[:, None] >= k_idx[None, :]
+            X = tl.where(mask, X, float('-inf'))
         m_i = tl.max(X, axis=-1)
         m = tl.maximum(m_prev, m_i)
         exp_m_prev = tl.exp(m_prev - m)
         exp_x_m = tl.exp(X - m[:,None])
         l = l_prev * exp_m_prev + tl.sum(exp_x_m, axis=-1)
         o = o_prev * exp_m_prev[:,None]
-        o = o + tl.dot(exp_x_m, V)
+        o = o + tl.dot(exp_x_m.to(V.dtype), V)
         m_prev = m
         l_prev = l
         o_prev = o
@@ -471,5 +480,5 @@ def flash_fwd_kernel(
         V_block = V_block.advance((BLOCK_K, 0))
 
     o_prev = o_prev / l_prev[:,None]
-    tl.store(O_block, o_prev)
-    tl.store(L_block, m_prev + tl.log(l_prev + 1e-20))
+    tl.store(O_block, o_prev.to(Q.dtype), boundary_check=(0, 1))
+    tl.store(L_block, m_prev + tl.log(l_prev + 1e-20), boundary_check=(0,))
