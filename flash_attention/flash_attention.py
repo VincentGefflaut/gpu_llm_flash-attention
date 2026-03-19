@@ -100,36 +100,9 @@ class FlashAttentionPytorch(torch.autograd.Function):
             None: No gradient for is_causal
         """
         Q, K, V, L, O = ctx.saved_tensors
-        device = Q.device
-        dtype = Q.dtype
-        batch_size, seq_q, d = Q.shape
-        seq_k = K.shape[1]
-
-        # Allocate outputs
-        dQ = torch.zeros_like(Q)
-        dK = torch.zeros_like(K)
-        dV = torch.zeros_like(V)
-
-        # Launch Triton backward kernel
-        BLOCK_Q = 64
-        BLOCK_K = 32
-        grid = (triton.cdiv(seq_q, BLOCK_Q), batch_size)
-
-        flash_bwd_kernel[grid](
-            Q, K, V, O, L, dO, dQ, dK, dV,
-            Q.stride(0), Q.stride(1), Q.stride(2),
-            K.stride(0), K.stride(1), K.stride(2),
-            V.stride(0), V.stride(1), V.stride(2),
-            O.stride(0), O.stride(1), O.stride(2),
-            L.stride(0), L.stride(1),
-            dO.stride(0), dO.stride(1), dO.stride(2),
-            dQ.stride(0), dQ.stride(1), dQ.stride(2),
-            dK.stride(0), dK.stride(1), dK.stride(2),
-            dV.stride(0), dV.stride(1), dV.stride(2),
-            seq_q, seq_k, ctx.sqrt_d,
-            D=d, BLOCK_Q=BLOCK_Q, BLOCK_K=BLOCK_K, is_causal=ctx.is_causal,
+        dQ, dK, dV, _ = attention_backward_impl(
+            Q, K, V, L, O, dO, ctx.sqrt_d, ctx.is_causal
         )
-
         return dQ, dK, dV, None
 
 def attention_backward_impl(Q, K, V, L, O, dO, sqrt_d, is_causal):
